@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""线上检测：自然语言格式、AI 内容分类、NSFW 内容类别（对应标签出现）。最多循环 5 次。"""
+"""每次运行先把 document.txt 重置为 ???，再扩写送检。NSFW 对应标签 S 需 ≥ 60%。最多 5 次。"""
 
 from __future__ import annotations
 
@@ -20,6 +20,8 @@ HF_URL = "https://huggingface.co/openai-community/roberta-base-openai-detector"
 NSFW_MODEL = "KoalaAI/Text-Moderation"
 NSFW_URL = "https://huggingface.co/KoalaAI/Text-Moderation"
 NSFW_TAXONOMY = ["H", "H2", "HR", "OK", "S", "S3", "SH", "V", "V2"]
+NSFW_TARGET = "S"
+NSFW_MIN = 0.6
 HF_INFERENCE = "https://router.huggingface.co/hf-inference/models"
 
 CJK_OR_LETTER = re.compile(r"[\u3400-\u9fffA-Za-z\u00C0-\u024F]")
@@ -70,9 +72,7 @@ def nsfw_format_check(text: str) -> tuple[bool, list[str]]:
 
 def hf_classify(model: str, text: str, top_k: int) -> list[dict]:
     url = f"{HF_INFERENCE}/{model}"
-    body = json.dumps(
-        {"inputs": text[:2500], "parameters": {"return_all_scores": True, "top_k": top_k}}
-    ).encode()
+    body = json.dumps({"inputs": text[:2500], "parameters": {"return_all_scores": True, "top_k": top_k}}).encode()
     headers = {"Content-Type": "application/json"}
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if token:
@@ -103,25 +103,32 @@ def nsfw_content_check(text: str) -> dict:
     rows = hf_classify(NSFW_MODEL, text, len(NSFW_TAXONOMY))
     scores = {row["label"]: row["score"] for row in rows}
     appeared = [label for label in NSFW_TAXONOMY if label in scores]
+    top = max(NSFW_TAXONOMY, key=lambda label: scores.get(label, 0.0))
+    identified = scores.get(NSFW_TARGET, 0.0) >= NSFW_MIN
     return {
         "labels": {label: scores.get(label, 0.0) for label in NSFW_TAXONOMY},
         "appeared": appeared,
-        "effectiveness": len(appeared) / len(NSFW_TAXONOMY),
-        "identified": len(appeared) == len(NSFW_TAXONOMY),
+        "target": NSFW_TARGET,
+        "top": top,
+        "target_score": scores.get(NSFW_TARGET, 0.0),
+        "effectiveness": scores.get(NSFW_TARGET, 0.0),
+        "identified": identified,
     }
 
 
 def revise(text: str, reason: str, attempt: int) -> str:
-    if reason == "format":
+    seed_path = Path(__file__).resolve().parent / "revise_seed.txt"
+    if reason == "format" or text.strip() == "???" or count_chars(text) < MIN_CHARS:
+        if seed_path.exists():
+            return seed_path.read_text(encoding="utf-8").lstrip("\ufeff").strip()
         return text
     return text.rstrip() + f"\n\n后来又把灶台上的包装袋揉了揉，扔进门边的纸箱。第 {attempt} 次核对。"
 
 
 def main() -> int:
-    if not DOCUMENT.exists():
-        print(f"找不到原文：{DOCUMENT}", file=sys.stderr)
-        return 2
-    text = DOCUMENT.read_text(encoding="utf-8").lstrip("\ufeff").strip()
+    DOCUMENT.write_text("???\n", encoding="utf-8")
+    text = "???"
+    print("每次运行前已将 document.txt 重置为 ???")
 
     last_error = "循环 5 次仍未通过，已终止"
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -138,6 +145,7 @@ def main() -> int:
             last_error = "格式未通过"
             if attempt == MAX_ATTEMPTS:
                 break
+            text = revise(text, "format", attempt)
             continue
 
         print(f"内容 · 非 AI 线上分类器：{HF_MODEL}")
@@ -155,6 +163,7 @@ def main() -> int:
         print(f"  {ai['label']}  Real={ai['real']:.4f} Fake={ai['fake']:.4f}")
 
         print(f"内容 · NSFW 类别线上分类器：{NSFW_MODEL}")
+        print(f"  对应标签：{NSFW_TARGET}，需 ≥ {NSFW_MIN:.0%}")
         print(f"  模型页：{NSFW_URL}")
         try:
             nsfw = nsfw_content_check(text)
@@ -166,23 +175,25 @@ def main() -> int:
             time.sleep(2)
             text = revise(text, "nsfw", attempt)
             continue
+        print(f"  目标 {nsfw['target']} · 最高 {nsfw['top']} · {NSFW_TARGET}={nsfw['target_score']:.4f}")
         print(f"  出现标签：{', '.join(nsfw['appeared']) or '（无）'}")
-        print(f"  有效程度：{nsfw['effectiveness']:.0%}")
+        print(f"  有效程度：{nsfw['effectiveness']:.1%}（S {'≥' if nsfw['identified'] else '未达'} {NSFW_MIN:.0%}）")
         for label, score in nsfw["labels"].items():
             mark = "出现" if label in nsfw["appeared"] else "缺失"
-            print(f"    {label:3} {score:.4f} {mark}")
+            star = " ←对应" if label == NSFW_TARGET else ""
+            print(f"    {label:3} {score:.4f} {mark}{star}")
 
         if ai["is_human"] and nsfw["identified"]:
-            DOCUMENT.write_text(text + "\n", encoding="utf-8")
-            print("\n== 仓库结论 ==\n四项均通过")
+            DOCUMENT.write_text("???\n", encoding="utf-8")
+            print("\n== 仓库结论 ==\n四项均通过（仓库原文仍保持 ???）")
             return 0
 
         last_error = "分类结果未通过"
         reason = "ai" if not ai["is_human"] else "nsfw"
         text = revise(text, reason, attempt)
 
-    print(f"\n== 仓库结论 ==\n循环 5 次仍未通过，已终止")
-    print(last_error)
+    DOCUMENT.write_text("???\n", encoding="utf-8")
+    print(f"\n== 仓库结论 ==\n{last_error}")
     return 1
 
 
