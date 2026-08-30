@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import os
 import re
 import sys
 from pathlib import Path
 
 MIN_CHARS = 1200
-MAX_ATTEMPTS = 5
 ROOT = Path(__file__).resolve().parent
 DOCUMENT = ROOT / "document.txt"
 MODELS = ROOT / "models"
@@ -74,7 +72,7 @@ def _download(repo_id: str, dest: Path) -> None:
         return
     from huggingface_hub import snapshot_download
 
-    snapshot_download(repo_id=repo_id, local_dir=str(dest), local_dir_use_symlinks=False)
+    snapshot_download(repo_id=repo_id, local_dir=str(dest))
 
 
 def ensure_models() -> None:
@@ -176,15 +174,15 @@ def inspect(text: str) -> int:
 
 
 def main() -> int:
-    DOCUMENT.write_text("???\n", encoding="utf-8")
-    override = os.environ.get("CHECK_TEXT_FILE")
-    text = Path(override).read_text(encoding="utf-8").lstrip("\ufeff").strip() if override else "???"
-    print("仓库原文保持 ???。正在准备本地分类器。")
-    ensure_models()
-    try:
-        return inspect(text)
-    finally:
+    if len(sys.argv) > 1 and sys.argv[1] == "--reset":
         DOCUMENT.write_text("???\n", encoding="utf-8")
+        print("document.txt 已重置为 ???")
+        return 0
+    if not DOCUMENT.exists():
+        DOCUMENT.write_text("???\n", encoding="utf-8")
+    text = DOCUMENT.read_text(encoding="utf-8").lstrip("\ufeff").strip()
+    ensure_models()
+    return inspect(text)
 
 
 if __name__ == "__main__":
