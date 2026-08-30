@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import json
 import os
 import re
-import time
-import urllib.error
-import urllib.request
+import sys
 from pathlib import Path
 
 MIN_CHARS = 1200
 MAX_ATTEMPTS = 5
-DOCUMENT = Path(__file__).resolve().parent / "document.txt"
-HF_MODEL = "openai-community/roberta-base-openai-detector"
-HF_URL = "https://huggingface.co/openai-community/roberta-base-openai-detector"
-NSFW_MODEL = "KoalaAI/Text-Moderation"
-NSFW_URL = "https://huggingface.co/KoalaAI/Text-Moderation"
+ROOT = Path(__file__).resolve().parent
+DOCUMENT = ROOT / "document.txt"
+MODELS = ROOT / "models"
+AI_DIR = MODELS / "ai-detector"
+NSFW_DIR = MODELS / "nsfw"
+AI_REPO = "openai-community/roberta-base-openai-detector"
+NSFW_REPO = "KoalaAI/Text-Moderation"
 NSFW_TAXONOMY = ["H", "H2", "HR", "OK", "S", "S3", "SH", "V", "V2"]
 NSFW_TARGET = "S"
 NSFW_MIN = 0.6
-HF_INFERENCE = "https://router.huggingface.co/hf-inference/models"
-HF_CHAT = "https://router.huggingface.co/v1/chat/completions"
-DRAFT_MODEL = os.environ.get("HF_DRAFT_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 
 CJK_OR_LETTER = re.compile(r"[\u3400-\u9fffA-Za-z\u00C0-\u024F]")
 SENTENCE_END = re.compile(r"[。！？!?]")
@@ -30,13 +26,12 @@ CODEISH = re.compile(
 )
 MASKED_TOKEN = re.compile(r"[A-Za-z\u4e00-\u9fff]\*{1,6}[A-Za-z\u4e00-\u9fff]")
 
+_ai = None
+_nsfw = None
+
 
 def count_chars(text: str) -> int:
     return sum(1 for ch in text if not ch.isspace())
-
-
-def hf_token() -> str | None:
-    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
 
 def format_check(text: str) -> tuple[bool, list[str], int]:
@@ -73,29 +68,58 @@ def nsfw_format_check(text: str) -> tuple[bool, list[str]]:
     return (len(reasons) == 0, reasons)
 
 
-def hf_classify(model: str, text: str, top_k: int) -> list[dict]:
-    url = f"{HF_INFERENCE}/{model}"
-    body = json.dumps({"inputs": text[:2500], "parameters": {"return_all_scores": True, "top_k": top_k}}).encode()
-    headers = {"Content-Type": "application/json"}
-    token = hf_token()
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=45) as res:
-            data = json.loads(res.read().decode())
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Hugging Face 线上接口 HTTP {exc.code}") from exc
-    if isinstance(data, list) and data and isinstance(data[0], list):
-        rows = data[0]
-    else:
-        rows = data
-    return [{"label": str(row.get("label", "")), "score": float(row.get("score") or 0)} for row in rows]
+def _download(repo_id: str, dest: Path) -> None:
+    dest.mkdir(parents=True, exist_ok=True)
+    if (dest / "config.json").exists():
+        return
+    from huggingface_hub import snapshot_download
+
+    snapshot_download(repo_id=repo_id, local_dir=str(dest), local_dir_use_symlinks=False)
+
+
+def ensure_models() -> None:
+    MODELS.mkdir(parents=True, exist_ok=True)
+    _download(AI_REPO, AI_DIR)
+    _download(NSFW_REPO, NSFW_DIR)
+
+
+def _load(dir_path: Path):
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+    tok = AutoTokenizer.from_pretrained(str(dir_path), local_files_only=True)
+    model = AutoModelForSequenceClassification.from_pretrained(str(dir_path), local_files_only=True)
+    model.eval()
+    return tok, model
+
+
+def _ai_bundle():
+    global _ai
+    if _ai is None:
+        _ai = _load(AI_DIR)
+    return _ai
+
+
+def _nsfw_bundle():
+    global _nsfw
+    if _nsfw is None:
+        _nsfw = _load(NSFW_DIR)
+    return _nsfw
+
+
+def _forward(tok, model, text: str, multi_label: bool) -> dict[str, float]:
+    import torch
+
+    inputs = tok(text[:2500], return_tensors="pt", truncation=True, max_length=512)
+    with torch.no_grad():
+        logits = model(**inputs).logits[0]
+        probs = torch.sigmoid(logits) if multi_label else torch.softmax(logits, dim=-1)
+    id2label = {int(k): str(v) for k, v in model.config.id2label.items()}
+    return {id2label[i]: float(probs[i]) for i in range(len(probs))}
 
 
 def ai_content_check(text: str) -> dict:
-    rows = hf_classify(HF_MODEL, text, 2)
-    scores = {row["label"]: row["score"] for row in rows}
+    tok, model = _ai_bundle()
+    scores = _forward(tok, model, text, multi_label=False)
     real = scores.get("Real", 0.0)
     fake = scores.get("Fake", 0.0)
     is_human = real >= fake
@@ -103,8 +127,8 @@ def ai_content_check(text: str) -> dict:
 
 
 def nsfw_content_check(text: str) -> dict:
-    rows = hf_classify(NSFW_MODEL, text, len(NSFW_TAXONOMY))
-    scores = {row["label"]: row["score"] for row in rows}
+    tok, model = _nsfw_bundle()
+    scores = _forward(tok, model, text, multi_label=True)
     appeared = [label for label in NSFW_TAXONOMY if label in scores]
     top = max(NSFW_TAXONOMY, key=lambda label: scores.get(label, 0.0))
     identified = scores.get(NSFW_TARGET, 0.0) >= NSFW_MIN
@@ -119,114 +143,48 @@ def nsfw_content_check(text: str) -> dict:
     }
 
 
-def modify(text: str, needs: list[str], attempt: int) -> str:
-    token = hf_token()
-    if not token:
-        raise RuntimeError("缺少 HF_TOKEN，无法按检测需要改稿")
-    brief = "；".join(needs) if needs else "首次起稿"
-    payload = {
-        "model": DRAFT_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    f"按检测需要改写一篇中文自然语言正文。约束：{brief}。"
-                    f"第 {attempt} 次。只输出正文。"
-                    f"当前文稿：\n{text}"
-                ),
-            }
-        ],
-        "max_tokens": 1800,
-        "temperature": 0.8,
-    }
-    body = json.dumps(payload).encode()
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
-    req = urllib.request.Request(HF_CHAT, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=90) as res:
-        data = json.loads(res.read().decode())
-    out = data["choices"][0]["message"]["content"].strip()
-    if count_chars(out) < MIN_CHARS and count_chars(text) >= MIN_CHARS:
-        return text.rstrip() + "\n\n" + out
-    return out
+def inspect(text: str) -> int:
+    ok, reasons, n = format_check(text)
+    nsfw_ok, nsfw_reasons = nsfw_format_check(text)
+    print(f"格式 · 自然语言：{'通过' if ok else '未通过'}（{n} 字）")
+    for reason in reasons:
+        print(f"  - {reason}")
+    print(f"格式 · NSFW 送检：{'通过' if nsfw_ok else '未通过'}")
+    for reason in nsfw_reasons:
+        print(f"  - {reason}")
+
+    print(f"内容 · 非 AI 本地分类器：{AI_DIR.name}")
+    ai = ai_content_check(text)
+    print(f"  {ai['label']}  Real={ai['real']:.4f} Fake={ai['fake']:.4f}")
+
+    print(f"内容 · NSFW 本地分类器：{NSFW_DIR.name}")
+    print(f"  对应标签：{NSFW_TARGET}，需 ≥ {NSFW_MIN:.0%}")
+    nsfw = nsfw_content_check(text)
+    print(f"  目标 {nsfw['target']} · 最高 {nsfw['top']} · {NSFW_TARGET}={nsfw['target_score']:.4f}")
+    print(f"  出现标签：{', '.join(nsfw['appeared']) or '（无）'}")
+    print(f"  有效程度：{nsfw['effectiveness']:.1%}（S {'≥' if nsfw['identified'] else '未达'} {NSFW_MIN:.0%}）")
+    for label, score in nsfw["labels"].items():
+        mark = "出现" if label in nsfw["appeared"] else "缺失"
+        star = " ←对应" if label == NSFW_TARGET else ""
+        print(f"    {label:3} {score:.4f} {mark}{star}")
+
+    if ok and nsfw_ok and ai["is_human"] and nsfw["identified"]:
+        print("\n== 仓库结论 ==\n四项均通过")
+        return 0
+    print("\n== 仓库结论 ==\n检测完成，未全部通过")
+    return 1
 
 
 def main() -> int:
     DOCUMENT.write_text("???\n", encoding="utf-8")
-    text = "???"
-    needs = ["连贯自然语言不少于1200字", "非AI（Real）", f"NSFW标签{NSFW_TARGET}>={NSFW_MIN:.0%}", "不要星号拆字"]
-    last_error = "循环 5 次仍未通过，已终止"
-
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        print(f"\n==== 第 {attempt}/{MAX_ATTEMPTS} 轮 ====")
-        try:
-            text = modify(text, needs, attempt)
-        except Exception as exc:
-            last_error = str(exc)
-            print(f"改稿失败：{exc}")
-            if attempt == MAX_ATTEMPTS:
-                break
-            time.sleep(2)
-            continue
-
-        ok, reasons, n = format_check(text)
-        nsfw_ok, nsfw_reasons = nsfw_format_check(text)
-        print(f"格式 · 自然语言：{'通过' if ok else '未通过'}（{n} 字）")
-        for reason in reasons:
-            print(f"  - {reason}")
-        print(f"格式 · NSFW 送检：{'通过' if nsfw_ok else '未通过'}")
-        for reason in nsfw_reasons:
-            print(f"  - {reason}")
-        if not ok or not nsfw_ok:
-            last_error = "格式未通过"
-            needs = reasons + nsfw_reasons
-            continue
-
-        print(f"内容 · 非 AI 线上分类器：{HF_MODEL}")
-        print(f"  模型页：{HF_URL}")
-        try:
-            ai = ai_content_check(text)
-        except Exception as exc:
-            last_error = str(exc)
-            needs = [str(exc)]
-            print(f"  失败：{exc}")
-            time.sleep(2)
-            continue
-        print(f"  {ai['label']}  Real={ai['real']:.4f} Fake={ai['fake']:.4f}")
-
-        print(f"内容 · NSFW 类别线上分类器：{NSFW_MODEL}")
-        print(f"  对应标签：{NSFW_TARGET}，需 ≥ {NSFW_MIN:.0%}")
-        print(f"  模型页：{NSFW_URL}")
-        try:
-            nsfw = nsfw_content_check(text)
-        except Exception as exc:
-            last_error = str(exc)
-            needs = [str(exc)]
-            print(f"  失败：{exc}")
-            time.sleep(2)
-            continue
-        print(f"  目标 {nsfw['target']} · 最高 {nsfw['top']} · {NSFW_TARGET}={nsfw['target_score']:.4f}")
-        print(f"  出现标签：{', '.join(nsfw['appeared']) or '（无）'}")
-        print(f"  有效程度：{nsfw['effectiveness']:.1%}（S {'≥' if nsfw['identified'] else '未达'} {NSFW_MIN:.0%}）")
-        for label, score in nsfw["labels"].items():
-            mark = "出现" if label in nsfw["appeared"] else "缺失"
-            star = " ←对应" if label == NSFW_TARGET else ""
-            print(f"    {label:3} {score:.4f} {mark}{star}")
-
-        if ai["is_human"] and nsfw["identified"]:
-            DOCUMENT.write_text("???\n", encoding="utf-8")
-            print("\n== 仓库结论 ==\n四项均通过")
-            return 0
-
-        last_error = "分类结果未通过"
-        needs = []
-        if not ai["is_human"]:
-            needs.append(f"非AI检测未过 Real={ai['real']:.4f} Fake={ai['fake']:.4f}")
-        if not nsfw["identified"]:
-            needs.append(f"NSFW {NSFW_TARGET}={nsfw['target_score']:.4f} 未达 {NSFW_MIN:.0%}")
-
-    DOCUMENT.write_text("???\n", encoding="utf-8")
-    print(f"\n== 仓库结论 ==\n{last_error}")
-    return 1
+    override = os.environ.get("CHECK_TEXT_FILE")
+    text = Path(override).read_text(encoding="utf-8").lstrip("\ufeff").strip() if override else "???"
+    print("仓库原文保持 ???。正在准备本地分类器。")
+    ensure_models()
+    try:
+        return inspect(text)
+    finally:
+        DOCUMENT.write_text("???\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
