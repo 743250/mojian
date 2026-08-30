@@ -151,7 +151,7 @@ def modify(text: str, needs: list[str], attempt: int) -> str:
 
 
 def main() -> int:
-    DOCUMENT.write_text("?​?​?\n".replace("\u200b", "") if False else "???\n", encoding="utf-8")
+    DOCUMENT.write_text("???\n", encoding="utf-8")
     text = "???"
     needs = ["连贯自然语言不少于1200字", "非AI（Real）", f"NSFW标签{NSFW_TARGET}>={NSFW_MIN:.0%}", "不要星号拆字"]
     last_error = "循环 5 次仍未通过，已终止"
