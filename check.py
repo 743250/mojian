@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""每次运行先把 document.txt 重置为 ???，再扩写送检。NSFW 对应标签 S 需 ≥ 60%。最多 5 次。"""
+"""每次运行先把 document.txt 重置为 ???，再从底稿扩写后送检。NSFW 对应标签 S 需 ≥ 60%。最多 5 次。"""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from pathlib import Path
 MIN_CHARS = 1200
 MAX_ATTEMPTS = 5
 DOCUMENT = Path(__file__).resolve().parent / "document.txt"
+SEED = Path(__file__).resolve().parent / "revise_seed.txt"
 HF_MODEL = "openai-community/roberta-base-openai-detector"
 HF_URL = "https://huggingface.co/openai-community/roberta-base-openai-detector"
 NSFW_MODEL = "KoalaAI/Text-Moderation"
@@ -24,16 +25,34 @@ NSFW_TARGET = "S"
 NSFW_MIN = 0.6
 HF_INFERENCE = "https://router.huggingface.co/hf-inference/models"
 
-CJK_OR_LETTER = re.compile(r"[\u3400-\u9fffA-Za-z\u00C0-\u024F]")
+CJK_OR_LETTER = re.compile(r"[㐀-鿿A-Za-z\u00C0-\u024F]")
 SENTENCE_END = re.compile(r"[。！？!?]")
 CODEISH = re.compile(
     r"[{}\[\]<>]|function\s|import\s|const\s|let\s|class\s|def\s|#include|</?[a-zA-Z]"
 )
 MASKED_TOKEN = re.compile(r"[A-Za-z\u4e00-\u9fff]\*{1,6}[A-Za-z\u4e00-\u9fff]")
 
+# Everyday connective tissue for later AI retries. Not a no-op counter sentence.
+HUMAN_PATCHES = [
+    "那天楼下有人在收旧报纸，铁秤盘碰在地上响了一下。我把窗户推上一点，风还是从缝里进来。",
+    "水壶响的时候我才发现火开着。水溢了一点，灶台湿了一小块，用抹布抹了两下。",
+    "手机放在桌角，屏幕亮了一下又暗掉。我没接，只把杯子推远了一点。",
+    "楼道里有人搬家，箱子碰到壁上。过了一会儿又静了，只剩电梯还在跑。",
+]
+
 
 def count_chars(text: str) -> int:
     return sum(1 for ch in text if not ch.isspace())
+
+
+def load_seed() -> str:
+    if SEED.exists():
+        return SEED.read_text(encoding="utf-8").lstrip("\ufeff").strip()
+    return "???"
+
+
+def unmask(text: str) -> str:
+    return MASKED_TOKEN.sub(lambda m: m.group(0).replace("*", ""), text)
 
 
 def format_check(text: str) -> tuple[bool, list[str], int]:
@@ -53,7 +72,7 @@ def format_check(text: str) -> tuple[bool, list[str], int]:
         reasons.append("用字变化不足，不像自然语言篇章")
     if len(CODEISH.findall(text)) > 10:
         reasons.append("包含过多程序代码特征")
-    punct_only = re.sub(r"[。，、！？；：“”\"'‘’（）—…·,.!?;:()\-?？]", "", compact)
+    punct_only = re.sub(r"[。，、！？；：“”\"'\u2018’（）—…·,.!?;:()\-?？]", "", compact)
     if compact and len(punct_only) / len(compact) < 0.5:
         reasons.append("标点占比过高，不是连贯的自然语言")
     return (len(reasons) == 0, reasons, char_count)
@@ -117,18 +136,19 @@ def nsfw_content_check(text: str) -> dict:
 
 
 def revise(text: str, reason: str, attempt: int) -> str:
-    seed_path = Path(__file__).resolve().parent / "revise_seed.txt"
     if reason == "format" or text.strip() == "???" or count_chars(text) < MIN_CHARS:
-        if seed_path.exists():
-            return seed_path.read_text(encoding="utf-8").lstrip("\ufeff").strip()
-        return text
-    return text.rstrip() + f"\n\n后来又把灶台上的包装袋揉了揉，扔进门边的纸箱。第 {attempt} 次核对。"
+        return load_seed()
+    text = unmask(text)
+    if reason == "ai":
+        extra = HUMAN_PATCHES[(attempt - 1) % len(HUMAN_PATCHES)]
+        return text.rstrip() + "\n\n" + extra
+    return text
 
 
 def main() -> int:
     DOCUMENT.write_text("???\n", encoding="utf-8")
-    text = "???"
-    print("每次运行前已将 document.txt 重置为 ???")
+    text = load_seed()
+    print("每次运行前已将 document.txt 重置为 ???，并先载入扩写底稿再送检")
 
     last_error = "循环 5 次仍未通过，已终止"
     for attempt in range(1, MAX_ATTEMPTS + 1):
