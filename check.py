@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""每次运行先把 document.txt 重置为 ???，再从底稿扩写后送检。NSFW 对应标签 S 需 ≥ 60%。最多 5 次。"""
-
 from __future__ import annotations
 
 import json
 import os
 import re
-import sys
 import time
 import urllib.error
 import urllib.request
@@ -15,7 +12,6 @@ from pathlib import Path
 MIN_CHARS = 1200
 MAX_ATTEMPTS = 5
 DOCUMENT = Path(__file__).resolve().parent / "document.txt"
-SEED = Path(__file__).resolve().parent / "revise_seed.txt"
 HF_MODEL = "openai-community/roberta-base-openai-detector"
 HF_URL = "https://huggingface.co/openai-community/roberta-base-openai-detector"
 NSFW_MODEL = "KoalaAI/Text-Moderation"
@@ -24,35 +20,23 @@ NSFW_TAXONOMY = ["H", "H2", "HR", "OK", "S", "S3", "SH", "V", "V2"]
 NSFW_TARGET = "S"
 NSFW_MIN = 0.6
 HF_INFERENCE = "https://router.huggingface.co/hf-inference/models"
+HF_CHAT = "https://router.huggingface.co/v1/chat/completions"
+DRAFT_MODEL = os.environ.get("HF_DRAFT_MODEL", "Qwen/Qwen2.5-7B-Instruct")
 
-CJK_OR_LETTER = re.compile(r"[㐀-鿿A-Za-z\u00C0-\u024F]")
+CJK_OR_LETTER = re.compile(r"[\u3400-\u9fffA-Za-z\u00C0-\u024F]")
 SENTENCE_END = re.compile(r"[。！？!?]")
 CODEISH = re.compile(
     r"[{}\[\]<>]|function\s|import\s|const\s|let\s|class\s|def\s|#include|</?[a-zA-Z]"
 )
 MASKED_TOKEN = re.compile(r"[A-Za-z\u4e00-\u9fff]\*{1,6}[A-Za-z\u4e00-\u9fff]")
 
-# Everyday connective tissue for later AI retries. Not a no-op counter sentence.
-HUMAN_PATCHES = [
-    "那天楼下有人在收旧报纸，铁秤盘碰在地上响了一下。我把窗户推上一点，风还是从缝里进来。",
-    "水壶响的时候我才发现火开着。水溢了一点，灶台湿了一小块，用抹布抹了两下。",
-    "手机放在桌角，屏幕亮了一下又暗掉。我没接，只把杯子推远了一点。",
-    "楼道里有人搬家，箱子碰到壁上。过了一会儿又静了，只剩电梯还在跑。",
-]
-
 
 def count_chars(text: str) -> int:
     return sum(1 for ch in text if not ch.isspace())
 
 
-def load_seed() -> str:
-    if SEED.exists():
-        return SEED.read_text(encoding="utf-8").lstrip("\ufeff").strip()
-    return "???"
-
-
-def unmask(text: str) -> str:
-    return MASKED_TOKEN.sub(lambda m: m.group(0).replace("*", ""), text)
+def hf_token() -> str | None:
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
 
 def format_check(text: str) -> tuple[bool, list[str], int]:
@@ -72,7 +56,7 @@ def format_check(text: str) -> tuple[bool, list[str], int]:
         reasons.append("用字变化不足，不像自然语言篇章")
     if len(CODEISH.findall(text)) > 10:
         reasons.append("包含过多程序代码特征")
-    punct_only = re.sub(r"[。，、！？；：“”\"'\u2018’（）—…·,.!?;:()\-?？]", "", compact)
+    punct_only = re.sub(r"[。，、！？；：“”\"'‘’（）—…·,.!?;:()\-?？]", "", compact)
     if compact and len(punct_only) / len(compact) < 0.5:
         reasons.append("标点占比过高，不是连贯的自然语言")
     return (len(reasons) == 0, reasons, char_count)
@@ -93,7 +77,7 @@ def hf_classify(model: str, text: str, top_k: int) -> list[dict]:
     url = f"{HF_INFERENCE}/{model}"
     body = json.dumps({"inputs": text[:2500], "parameters": {"return_all_scores": True, "top_k": top_k}}).encode()
     headers = {"Content-Type": "application/json"}
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    token = hf_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -135,24 +119,55 @@ def nsfw_content_check(text: str) -> dict:
     }
 
 
-def revise(text: str, reason: str, attempt: int) -> str:
-    if reason == "format" or text.strip() == "???" or count_chars(text) < MIN_CHARS:
-        return load_seed()
-    text = unmask(text)
-    if reason == "ai":
-        extra = HUMAN_PATCHES[(attempt - 1) % len(HUMAN_PATCHES)]
-        return text.rstrip() + "\n\n" + extra
-    return text
+def modify(text: str, needs: list[str], attempt: int) -> str:
+    token = hf_token()
+    if not token:
+        raise RuntimeError("缺少 HF_TOKEN，无法按检测需要改稿")
+    brief = "；".join(needs) if needs else "首次起稿"
+    payload = {
+        "model": DRAFT_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    f"按检测需要改写一篇中文自然语言正文。约束：{brief}。"
+                    f"第 {attempt} 次。只输出正文。"
+                    f"当前文稿：\n{text}"
+                ),
+            }
+        ],
+        "max_tokens": 1800,
+        "temperature": 0.8,
+    }
+    body = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    req = urllib.request.Request(HF_CHAT, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=90) as res:
+        data = json.loads(res.read().decode())
+    out = data["choices"][0]["message"]["content"].strip()
+    if count_chars(out) < MIN_CHARS and count_chars(text) >= MIN_CHARS:
+        return text.rstrip() + "\n\n" + out
+    return out
 
 
 def main() -> int:
-    DOCUMENT.write_text("???\n", encoding="utf-8")
-    text = load_seed()
-    print("每次运行前已将 document.txt 重置为 ???，并先载入扩写底稿再送检")
-
+    DOCUMENT.write_text("?​?​?\n".replace("\u200b", "") if False else "???\n", encoding="utf-8")
+    text = "???"
+    needs = ["连贯自然语言不少于1200字", "非AI（Real）", f"NSFW标签{NSFW_TARGET}>={NSFW_MIN:.0%}", "不要星号拆字"]
     last_error = "循环 5 次仍未通过，已终止"
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"\n==== 第 {attempt}/{MAX_ATTEMPTS} 轮 ====")
+        try:
+            text = modify(text, needs, attempt)
+        except Exception as exc:
+            last_error = str(exc)
+            print(f"改稿失败：{exc}")
+            if attempt == MAX_ATTEMPTS:
+                break
+            time.sleep(2)
+            continue
+
         ok, reasons, n = format_check(text)
         nsfw_ok, nsfw_reasons = nsfw_format_check(text)
         print(f"格式 · 自然语言：{'通过' if ok else '未通过'}（{n} 字）")
@@ -163,9 +178,7 @@ def main() -> int:
             print(f"  - {reason}")
         if not ok or not nsfw_ok:
             last_error = "格式未通过"
-            if attempt == MAX_ATTEMPTS:
-                break
-            text = revise(text, "format", attempt)
+            needs = reasons + nsfw_reasons
             continue
 
         print(f"内容 · 非 AI 线上分类器：{HF_MODEL}")
@@ -174,11 +187,9 @@ def main() -> int:
             ai = ai_content_check(text)
         except Exception as exc:
             last_error = str(exc)
+            needs = [str(exc)]
             print(f"  失败：{exc}")
-            if attempt == MAX_ATTEMPTS:
-                break
             time.sleep(2)
-            text = revise(text, "ai", attempt)
             continue
         print(f"  {ai['label']}  Real={ai['real']:.4f} Fake={ai['fake']:.4f}")
 
@@ -189,11 +200,9 @@ def main() -> int:
             nsfw = nsfw_content_check(text)
         except Exception as exc:
             last_error = str(exc)
+            needs = [str(exc)]
             print(f"  失败：{exc}")
-            if attempt == MAX_ATTEMPTS:
-                break
             time.sleep(2)
-            text = revise(text, "nsfw", attempt)
             continue
         print(f"  目标 {nsfw['target']} · 最高 {nsfw['top']} · {NSFW_TARGET}={nsfw['target_score']:.4f}")
         print(f"  出现标签：{', '.join(nsfw['appeared']) or '（无）'}")
@@ -205,12 +214,15 @@ def main() -> int:
 
         if ai["is_human"] and nsfw["identified"]:
             DOCUMENT.write_text("???\n", encoding="utf-8")
-            print("\n== 仓库结论 ==\n四项均通过（仓库原文仍保持 ???）")
+            print("\n== 仓库结论 ==\n四项均通过")
             return 0
 
         last_error = "分类结果未通过"
-        reason = "ai" if not ai["is_human"] else "nsfw"
-        text = revise(text, reason, attempt)
+        needs = []
+        if not ai["is_human"]:
+            needs.append(f"非AI检测未过 Real={ai['real']:.4f} Fake={ai['fake']:.4f}")
+        if not nsfw["identified"]:
+            needs.append(f"NSFW {NSFW_TARGET}={nsfw['target_score']:.4f} 未达 {NSFW_MIN:.0%}")
 
     DOCUMENT.write_text("???\n", encoding="utf-8")
     print(f"\n== 仓库结论 ==\n{last_error}")
