@@ -53,15 +53,15 @@ def format_check(text: str) -> tuple[bool, list[str], int]:
         reasons.append("用字变化不足，不像自然语言篇章")
     if len(CODEISH.findall(text)) > 10:
         reasons.append("包含过多程序代码特征")
-    punct_only = re.sub(r"[。，、！？；：“”\"'‘’（）—…·,.!?;:()\-?？]", "", compact)
-    if compact and len(punct_only) / len(compact) < 0.5:
+    without_punct = re.sub(r"[。，、！？；：“”\"'‘’（）—…·,.!?;:()\-?？]", "", compact)
+    if compact and len(without_punct) / len(compact) < 0.5:
         reasons.append("标点占比过高，不是连贯的自然语言")
     return (len(reasons) == 0, reasons, char_count)
 
 
-def nsfw_format_check(text: str) -> tuple[bool, list[str]]:
+def nsfw_format_check(text: str, base: tuple[bool, list[str], int] | None = None) -> tuple[bool, list[str]]:
     reasons: list[str] = []
-    ok, base_reasons, _ = format_check(text)
+    ok, base_reasons, _ = base if base is not None else format_check(text)
     if not ok:
         reasons.append("NSFW 送检格式要求先满足自然语言全文（不少于 1200 字）")
         reasons.extend(base_reasons)
@@ -70,11 +70,15 @@ def nsfw_format_check(text: str) -> tuple[bool, list[str]]:
     return (len(reasons) == 0, reasons)
 
 
+def hf_token() -> str | None:
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+
 def hf_classify(model: str, text: str, top_k: int) -> list[dict]:
     url = f"{HF_INFERENCE}/{model}"
-    body = json.dumps({"inputs": text[:2500], "parameters": {"return_all_scores": True, "top_k": top_k}}).encode()
+    body = json.dumps({"inputs": text[:2500], "parameters": {"top_k": top_k}}).encode()
     headers = {"Content-Type": "application/json"}
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    token = hf_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -82,7 +86,14 @@ def hf_classify(model: str, text: str, top_k: int) -> list[dict]:
         with urllib.request.urlopen(req, timeout=45) as res:
             data = json.loads(res.read().decode())
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Hugging Face 线上接口 HTTP {exc.code}") from exc
+        try:
+            detail = exc.read().decode("utf-8", "replace").strip()
+        except Exception:
+            detail = ""
+        suffix = f"：{detail[:400]}" if detail else ""
+        raise RuntimeError(f"Hugging Face 线上接口 HTTP {exc.code}{suffix}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Hugging Face 线上接口连接失败：{exc.reason}") from exc
     if isinstance(data, list) and data and isinstance(data[0], list):
         rows = data[0]
     else:
@@ -126,6 +137,11 @@ def revise(text: str, reason: str, attempt: int) -> str:
 
 
 def main() -> int:
+    if not hf_token():
+        print("缺少 Hugging Face 令牌：请先设置 HF_TOKEN（或 HUGGING_FACE_HUB_TOKEN）", file=sys.stderr)
+        print("线上推理接口对本仓库使用的两个模型均要求鉴权，未带令牌会直接 401。", file=sys.stderr)
+        return 2
+
     DOCUMENT.write_text("???\n", encoding="utf-8")
     text = "???"
     print("每次运行前已将 document.txt 重置为 ???")
@@ -133,8 +149,9 @@ def main() -> int:
     last_error = "循环 5 次仍未通过，已终止"
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"\n==== 第 {attempt}/{MAX_ATTEMPTS} 轮 ====")
-        ok, reasons, n = format_check(text)
-        nsfw_ok, nsfw_reasons = nsfw_format_check(text)
+        base = format_check(text)
+        ok, reasons, n = base
+        nsfw_ok, nsfw_reasons = nsfw_format_check(text, base)
         print(f"格式 · 自然语言：{'通过' if ok else '未通过'}（{n} 字）")
         for reason in reasons:
             print(f"  - {reason}")
